@@ -1,4 +1,3 @@
-audioBridge.js
 // Converts audio between Twilio's format and Gemini's format
 //
 // Twilio → Gemini:  mulaw 8000Hz base64  →  PCM16 16000Hz base64
