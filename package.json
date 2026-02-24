@@ -1,0 +1,27 @@
+{
+  "name": "sb-voice-agent",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kilobco/sb-voice-agent.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/kilobco/sb-voice-agent/issues"
+  },
+  "homepage": "https://github.com/kilobco/sb-voice-agent#readme",
+  "description": "",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.97.0",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "twilio": "^5.12.2",
+    "ws": "^8.19.0"
+  }
+}
