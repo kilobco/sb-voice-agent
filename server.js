@@ -1,4 +1,4 @@
-dd// server.js
+// server.js
 //
 // Main entry point for the restaurant phone-ordering system.
 //
