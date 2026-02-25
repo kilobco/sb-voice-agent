@@ -1,4 +1,4 @@
-// server.js
+dd// server.js
 //
 // Main entry point for the restaurant phone-ordering system.
 //
@@ -28,7 +28,7 @@
 'use strict';
 
 require('dotenv').config();
-const http    = require('http');
+const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const TwilioStream = require('./twilioStream');
@@ -68,8 +68,8 @@ app.use(express.json());
 // Render, Railway, and other PaaS platforms poll this to verify the server is up.
 app.get('/health', (_req, res) => {
   res.status(200).json({
-    status:   'ok',
-    uptime:   Math.floor(process.uptime()),
+    status: 'ok',
+    uptime: Math.floor(process.uptime()),
     sessions: sessions.size,
   });
 });
@@ -80,9 +80,9 @@ app.get('/health', (_req, res) => {
 //   To    — the Twilio number that was dialled (restaurant number)
 //   CallSid — Twilio's call identifier
 app.post('/twiml', (req, res) => {
-  const host           = req.headers.host;
-  const callerPhone    = sanitizePhone(req.body?.From  || '');
-  const restaurantPhone = sanitizePhone(req.body?.To   || '');
+  const host = req.headers.host;
+  const callerPhone = sanitizePhone(req.body?.From || '');
+  const restaurantPhone = sanitizePhone(req.body?.To || '');
 
   if (!host) {
     console.error('[server] /twiml: missing Host header');
@@ -102,7 +102,7 @@ app.post('/twiml', (req, res) => {
 
 // ─── WebSocket server ─────────────────────────────────────────────────────────
 const server = http.createServer(app);
-const wss    = new WebSocketServer({ server, path: '/stream' });
+const wss = new WebSocketServer({ server, path: '/stream' });
 
 wss.on('connection', (ws, req) => {
   const remoteAddr = req.socket.remoteAddress;
@@ -178,7 +178,7 @@ function shutdown(signal) {
 
   // Close all active WebSocket connections (triggers TwilioStream.handleClose)
   wss.clients.forEach((ws) => {
-    try { ws.terminate(); } catch (_) {}
+    try { ws.terminate(); } catch (_) { }
   });
 
   // Force-exit after 30 s if graceful close hangs
@@ -190,7 +190,7 @@ function shutdown(signal) {
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -245,10 +245,25 @@ if (require.main === module) {
     console.log(`[server] Health check   : GET /health`);
 
     if (!process.env.TWILIO_ACCOUNT_SID) console.warn('[server] WARNING: TWILIO_ACCOUNT_SID not set');
-    if (!process.env.GEMINI_API_KEY)     console.warn('[server] WARNING: GEMINI_API_KEY not set');
-    if (!process.env.SUPABASE_URL)       console.warn('[server] WARNING: SUPABASE_URL not set');
+    if (!process.env.GEMINI_API_KEY) console.warn('[server] WARNING: GEMINI_API_KEY not set');
+    if (!process.env.SUPABASE_URL) console.warn('[server] WARNING: SUPABASE_URL not set');
   });
 }
+
+// ── Wire Peter 3's Gemini session into the call factory ──────────────
+const GeminiSession = require('./geminiSession');
+
+setGeminiHandlers((callSid, callDbId, twilioStream) => {
+  const session = new GeminiSession({
+    callSid,
+    callDbId,
+    onAudioResponse: (chunk) => twilioStream.sendAudioToCaller(chunk),
+    onTransferRequested: (number) => twilioStream.executeTransfer(number),
+    onSessionEnded: () => { }
+  });
+  session.start();
+  return session;
+});
 
 // ─── Exports (used by tests and Peter 3) ─────────────────────────────────────
 module.exports = {
@@ -258,7 +273,7 @@ module.exports = {
   sessions,      // Live session Map — Peter 3 can look up streams by callSid
   setGeminiHandlers,  // Peter 3 calls this to inject AI session factory
   // Exported for unit testing
-  _buildTwiml:      buildTwiml,
-  _sanitizePhone:   sanitizePhone,
-  _shutdown:        shutdown,
+  _buildTwiml: buildTwiml,
+  _sanitizePhone: sanitizePhone,
+  _shutdown: shutdown,
 };
