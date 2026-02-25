@@ -387,7 +387,9 @@ async function handleCompleteOrder(callSid, args) {
           customer_id: customer?.id || null,
           call_id: callDbId,
           status: 'confirmed',
-          total_amount: total
+          total_amount: total,
+          customer_name: customerName,
+          phone_number: phoneNumber
         })
         .select()
         .single();

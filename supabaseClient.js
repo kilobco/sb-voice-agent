@@ -242,6 +242,8 @@ async function writeOrder(callId, customerName, phoneNumber, cartItems) {
     call_id:       callId,
     status:        'confirmed',
     total_amount:  total,
+    customer_name: customerName,
+    phone_number:  phoneNumber,
   }).select().single();
   const order = handleResult('writeOrder:insertOrder', orderResult);
 

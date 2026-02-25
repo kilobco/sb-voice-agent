@@ -4,15 +4,17 @@
 // Implements the contractual interface agreed with Peter 1:
 //   new GeminiSession(opts)          — constructor
 //   session.start()                  — called when call connects
-//   session.onAudio(b64)        — called for every audio chunk from caller
-//   session.close()                   — called when call ends or is transferred
+//   session.onAudio(b64)             — called for every audio chunk from caller
+//   session.close()                  — called when call ends or is transferred
 //   opts.onAudioResponse(b64)        — you call this with Gemini audio output
 //   opts.onTransferRequested(num)    — you call this to trigger cold transfer
 //   opts.onSessionEnded()            — you call this after clean session close
 
 require('dotenv').config();
 
-const { GoogleGenAI, Modality } = require('@google/genai');
+// Red Team #6 — Modality enum intentionally NOT imported.
+// Use raw string 'AUDIO' to avoid undefined errors across SDK versions.
+const { GoogleGenAI } = require('@google/genai');
 const { SYSTEM_PROMPT } = require('./systemPrompt');
 const { tools } = require('./toolDefinitions');
 const {
@@ -32,22 +34,31 @@ class GeminiSession {
     // ── Peter 1's interface contract ──────────────────────────────────────
     this.callSid = callSid;
     this.callDbId = callDbId;
-    this.onAudioResponse = onAudioResponse;       // Peter 1 plays this to caller
+    this.onAudioResponse = onAudioResponse;         // Peter 1 plays this to caller
     this.onTransferRequested = onTransferRequested; // Peter 1 executes cold transfer
     this.onSessionEnded = onSessionEnded;           // Peter 1 cleans up sessions Map
 
     // ── Internal state ────────────────────────────────────────────────────
-    this.session = null;         // Gemini Live session object
-    this.sessionPromise = null;  // Promise resolving to session
+    this.session = null;
+    this.sessionPromise = null;
     this.isActive = false;
-    this.outputTranscript = '';  // Accumulate model speech for transfer detection
+
+    // Red Team #8 — Buffer audio arriving before Gemini session is ready.
+    // Cleared (not flushed) at greeting time — pre-greeting audio is line noise.
+    this.pendingAudio = [];
+
+    // Red Team #9 — Persistent transcript across all turns, never reset.
+    this.outputTranscript = '';
+    this.transferTriggered = false;
+
+    // Order lock — prevents close() from killing session mid-completeOrder.
+    this.orderInProgress = false;
   }
 
   // ── Called by Peter 1 when the call connects ──────────────────────────
 
   async start() {
     try {
-      // Create the in-memory cart for this call
       createSession(this.callSid, this.callDbId);
 
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -55,7 +66,8 @@ class GeminiSession {
       this.sessionPromise = ai.live.connect({
         model: MODEL,
         config: {
-          responseModalities: [Modality.AUDIO],
+          // Red Team #6 — raw string instead of Modality.AUDIO enum
+          responseModalities: ['AUDIO'],
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
           },
@@ -69,17 +81,28 @@ class GeminiSession {
             console.log(`Gemini session open for call: ${this.callSid}`);
             this.isActive = true;
 
-            // Trigger the agent to speak first immediately on connect
+            // Discard pre-greeting audio — it is all line noise from call setup.
+            this.pendingAudio = [];
+
+            // Trigger the agent to speak its opening line immediately
             this.sessionPromise.then(session => {
               const hour = new Date().getHours();
-              const greeting =
-                hour < 12 ? 'Good morning'
-                  : hour < 17 ? 'Good afternoon'
-                    : 'Good evening';
+              const timeOfDay =
+                hour < 12 ? 'morning'
+                : hour < 17 ? 'afternoon'
+                : 'evening';
 
-              session.sendRealtimeInput([{
-                text: `[START_CALL] ${greeting}. Begin your opening greeting immediately.`
-              }]);
+              // sendClientContent injects a proper conversation turn that
+              // the model must respond to, guaranteeing the greeting fires.
+              session.sendClientContent({
+                turns: [{
+                  role: 'user',
+                  parts: [{
+                    text: `[CALL_START] Good ${timeOfDay}. Deliver your opening greeting to the caller now.`
+                  }]
+                }],
+                turnComplete: true
+              });
             });
           },
 
@@ -108,14 +131,20 @@ class GeminiSession {
   }
 
   // ── Called by Peter 1 for every audio chunk from the caller ──────────
+  // server.js calls this as: session.geminiSession.onAudio(chunk)
 
   onAudio(base64Pcm16kChunk) {
-    if (!this.isActive || !this.session) return;
+    // Red Team #8 — Buffer if session not ready yet
+    if (!this.isActive || !this.session) {
+      this.pendingAudio.push(base64Pcm16kChunk);
+      return;
+    }
     try {
+      // FIX: JS SDK uses audio:{data,mimeType} not media:{mimeType,data}
       this.session.sendRealtimeInput({
-        media: {
-          mimeType: 'audio/pcm;rate=16000',
-          data: base64Pcm16kChunk
+        audio: {
+          data: base64Pcm16kChunk,
+          mimeType: 'audio/pcm;rate=16000'
         }
       });
     } catch (err) {
@@ -124,45 +153,54 @@ class GeminiSession {
   }
 
   // ── Called by Peter 1 when the call ends ─────────────────────────────
+  // server.js calls this as: session.geminiSession.close()
 
   close() {
-    this._cleanup();
+    if (this.orderInProgress) {
+      // Caller hung up during the completeOrder Supabase write window.
+      // Defer cleanup by 8s so the DB write finishes.
+      console.log(`[${this.callSid}] close() called while order in-flight — deferring cleanup 8s`);
+      setTimeout(() => this._cleanup(), 8000);
+    } else {
+      this._cleanup();
+    }
   }
 
   // ── Internal: handles all incoming Gemini server messages ────────────
 
   async _handleMessage(msg) {
-    // Handle audio interruption (customer talks over agent)
     if (msg.serverContent?.interrupted) {
-      // Nothing to do server-side — Peter 1 handles audio queue clearing
       return;
     }
 
-    // Handle audio response from Gemini → forward to Peter 1 → caller
-    const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-    if (audioData && this.onAudioResponse) {
-      this.onAudioResponse(audioData);
+    // FIX: Iterate ALL parts — Gemini may spread audio across multiple parts
+    const parts = msg.serverContent?.modelTurn?.parts;
+    if (parts && this.onAudioResponse) {
+      for (const part of parts) {
+        if (part?.inlineData?.data) {
+          this.onAudioResponse(part.inlineData.data);
+        }
+      }
     }
 
-    // Handle tool calls fired by Gemini
     if (msg.toolCall) {
       await this._handleToolCalls(msg.toolCall.functionCalls);
     }
 
-    // Accumulate output transcript for transfer phrase detection
+    // Red Team #9 — accumulate persistently, never reset
     if (msg.serverContent?.outputTranscription?.text) {
       this.outputTranscript += msg.serverContent.outputTranscription.text;
     }
 
-    // On turn complete — scan transcript for transfer trigger
     if (msg.serverContent?.turnComplete) {
-      if (this.outputTranscript.includes(TRANSFER_PHRASE)) {
+      if (!this.transferTriggered && this.outputTranscript.includes(TRANSFER_PHRASE)) {
+        this.transferTriggered = true;
         console.log(`Transfer phrase detected on call: ${this.callSid}`);
         if (this.onTransferRequested) {
           this.onTransferRequested(TRANSFER_NUMBER);
         }
       }
-      this.outputTranscript = ''; // Reset for next turn
+      // NOTE: outputTranscript intentionally NOT reset (Red Team #9)
     }
   }
 
@@ -171,20 +209,32 @@ class GeminiSession {
   async _handleToolCalls(functionCalls) {
     const responses = [];
 
+    // Snapshot session ref before any awaits — close() may null this.session
+    const sessionSnapshot = this.session;
+
     for (const fc of functionCalls) {
       let result;
 
       if (fc.name === 'manageOrder') {
         result = handleManageOrder(this.callSid, fc.args);
+
       } else if (fc.name === 'collectCustomerDetails') {
         result = collectCustomerDetails(this.callSid, fc.args);
-      } else if (fc.name === 'completeOrder') {
-        result = await handleCompleteOrder(this.callSid, fc.args);
 
-        // Schedule session end 12 seconds after confirmed order
-        // (gives agent time to say farewell)
+      } else if (fc.name === 'completeOrder') {
+        this.orderInProgress = true;
+        console.log(`[${this.callSid}] completeOrder started — order lock acquired`);
+
+        try {
+          result = await handleCompleteOrder(this.callSid, fc.args);
+        } finally {
+          this.orderInProgress = false;
+          console.log(`[${this.callSid}] completeOrder finished — order lock released`);
+        }
+
+        // Red Team #10 — 22s for full farewell
         if (result.orderId) {
-          setTimeout(() => this._cleanup(), 12000);
+          setTimeout(() => this._cleanup(), 22000);
         }
       }
 
@@ -195,10 +245,10 @@ class GeminiSession {
       });
     }
 
-    // Send all tool responses back to Gemini in a single call
-    if (this.session && responses.length > 0) {
+    // Use snapshot — this.session may be null if caller hung up during await
+    if (sessionSnapshot && responses.length > 0) {
       try {
-        this.session.sendToolResponse({ functionResponses: responses });
+        sessionSnapshot.sendToolResponse({ functionResponses: responses });
       } catch (err) {
         console.error('sendToolResponse error:', err.message);
       }
@@ -211,9 +261,10 @@ class GeminiSession {
     if (!this.isActive) return;
 
     this.isActive = false;
+    this.pendingAudio = [];
 
     if (this.session) {
-      try { this.session.close(); } catch (e) { }
+      try { this.session.close(); } catch (e) {}
       this.session = null;
     }
 
