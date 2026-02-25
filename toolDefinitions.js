@@ -39,6 +39,28 @@ const manageOrderTool = {
   }
 };
 
+const collectCustomerDetailsTool = {
+  name: 'collectCustomerDetails',
+  description:
+    'Collect and validate the customer\'s name and phone number. Call this BEFORE ' +
+    'completeOrder to ensure you have valid customer information. This function will ' +
+    'validate the inputs and store them for the final order confirmation.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      customerName: {
+        type: Type.STRING,
+        description: 'The full name of the customer for pickup.'
+      },
+      phoneNumber: {
+        type: Type.STRING,
+        description: 'The phone number of the customer. Include country code if provided.'
+      }
+    },
+    required: ['customerName', 'phoneNumber']
+  }
+};
+
 const completeOrderTool = {
   name: 'completeOrder',
   description:
@@ -66,6 +88,6 @@ const completeOrderTool = {
   }
 };
 
-const tools = [{ functionDeclarations: [manageOrderTool, completeOrderTool] }];
+const tools = [{ functionDeclarations: [manageOrderTool, collectCustomerDetailsTool, completeOrderTool] }];
 
 module.exports = { tools };

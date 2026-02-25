@@ -18,6 +18,7 @@ const { tools } = require('./toolDefinitions');
 const {
   createSession,
   handleManageOrder,
+  collectCustomerDetails,
   handleCompleteOrder,
   deleteSession
 } = require('./orderManager');
@@ -175,6 +176,8 @@ class GeminiSession {
 
       if (fc.name === 'manageOrder') {
         result = handleManageOrder(this.callSid, fc.args);
+      } else if (fc.name === 'collectCustomerDetails') {
+        result = collectCustomerDetails(this.callSid, fc.args);
       } else if (fc.name === 'completeOrder') {
         result = await handleCompleteOrder(this.callSid, fc.args);
 

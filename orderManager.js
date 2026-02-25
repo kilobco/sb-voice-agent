@@ -283,6 +283,47 @@ function handleManageOrder(callSid, args) {
   return { result: 'Cart updated successfully.' };
 }
 
+// ── Called when Gemini fires the collectCustomerDetails tool ───────────────
+
+function collectCustomerDetails(callSid, args) {
+  const session = getSession(callSid);
+  if (!session) {
+    return { result: 'Error: session not found', success: false };
+  }
+
+  const { customerName, phoneNumber } = args;
+
+  // Validate customer name
+  if (!customerName || customerName.trim().length === 0) {
+    return {
+      result: 'Please provide your full name.',
+      success: false
+    };
+  }
+
+  // Validate phone number (basic validation: at least 10 digits)
+  const phoneDigits = phoneNumber.replace(/\D/g, '');
+  if (phoneDigits.length < 10) {
+    return {
+      result: 'Please provide a valid phone number with at least 10 digits.',
+      success: false
+    };
+  }
+
+  // Store customer details in session
+  session.customerName = customerName.trim();
+  session.phoneNumber = phoneNumber;
+
+  console.log(`Customer details collected [${callSid}]: ${session.customerName} | ${session.phoneNumber}`);
+
+  return {
+    result: `Thank you, ${session.customerName}. I've saved your phone number: ${phoneNumber}. Let me confirm your order details.`,
+    success: true,
+    customerName: session.customerName,
+    phoneNumber: session.phoneNumber
+  };
+}
+
 // ── Red Team #14 — Retry helper ───────────────────────────────────────────
 // Wraps an async function with up to maxRetries attempts, 1s delay between each.
 
@@ -412,5 +453,6 @@ module.exports = {
   getSession,
   handleManageOrder,
   handleCompleteOrder,
-  deleteSession
+  deleteSession,
+  collectCustomerDetails
 };
