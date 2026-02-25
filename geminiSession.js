@@ -4,15 +4,17 @@
 // Implements the contractual interface agreed with Peter 1:
 //   new GeminiSession(opts)          — constructor
 //   session.start()                  — called when call connects
-//   session.onAudio(b64)        — called for every audio chunk from caller
-//   session.close()                   — called when call ends or is transferred
+//   session.receiveAudio(b64)        — called for every audio chunk from caller
+//   session.stop()                   — called when call ends or is transferred
 //   opts.onAudioResponse(b64)        — you call this with Gemini audio output
 //   opts.onTransferRequested(num)    — you call this to trigger cold transfer
 //   opts.onSessionEnded()            — you call this after clean session close
 
 require('dotenv').config();
 
-const { GoogleGenAI, Modality } = require('@google/genai');
+// NOTE: Modality enum intentionally NOT imported — use raw string 'AUDIO'
+// to avoid enum undefined errors across SDK versions (Red Team #6)
+const { GoogleGenAI } = require('@google/genai');
 const { SYSTEM_PROMPT } = require('./systemPrompt');
 const { tools } = require('./toolDefinitions');
 const {
@@ -31,22 +33,30 @@ class GeminiSession {
     // ── Peter 1's interface contract ──────────────────────────────────────
     this.callSid = callSid;
     this.callDbId = callDbId;
-    this.onAudioResponse = onAudioResponse;       // Peter 1 plays this to caller
+    this.onAudioResponse = onAudioResponse;         // Peter 1 plays this to caller
     this.onTransferRequested = onTransferRequested; // Peter 1 executes cold transfer
     this.onSessionEnded = onSessionEnded;           // Peter 1 cleans up sessions Map
 
     // ── Internal state ────────────────────────────────────────────────────
-    this.session = null;         // Gemini Live session object
-    this.sessionPromise = null;  // Promise resolving to session
+    this.session = null;
+    this.sessionPromise = null;
     this.isActive = false;
-    this.outputTranscript = '';  // Accumulate model speech for transfer detection
+
+    // Red Team #8 — Buffer audio arriving before Gemini session is ready.
+    // Cleared (not flushed) at greeting time — inbound call audio before the
+    // greeting is silence/line noise, not meaningful caller speech. Caller
+    // words only arrive AFTER they hear the greeting.
+    this.pendingAudio = [];
+
+    // Red Team #9 — Persistent transcript, never reset between turns.
+    this.outputTranscript = '';
+    this.transferTriggered = false;
   }
 
   // ── Called by Peter 1 when the call connects ──────────────────────────
 
   async start() {
     try {
-      // Create the in-memory cart for this call
       createSession(this.callSid, this.callDbId);
 
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -54,31 +64,66 @@ class GeminiSession {
       this.sessionPromise = ai.live.connect({
         model: MODEL,
         config: {
-          responseModalities: [Modality.AUDIO],
+          // Red Team #6 — raw string, not Modality enum
+          responseModalities: ['AUDIO'],
+
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
           },
+
           systemInstruction: SYSTEM_PROMPT,
           tools: tools,
           outputAudioTranscription: {},
-          inputAudioTranscription: {}
+          inputAudioTranscription: {},
+
+          // ── FIX: Noise / barge-in ──────────────────────────────────────
+          // Phone lines carry constant background noise. Default VAD is too
+          // sensitive and triggers on that noise, interrupting the agent
+          // mid-sentence. Lower sensitivity + longer silence threshold prevents
+          // this without making the agent unresponsive to real speech.
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              disabled: false,
+              startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
+              endOfSpeechSensitivity:   'END_SENSITIVITY_LOW',
+              prefixPaddingMs:  500,   // Require 500ms of speech before triggering
+              silenceDurationMs: 2000  // Wait 2s of silence before ending a turn
+            }
+          }
         },
+
         callbacks: {
           onopen: () => {
             console.log(`Gemini session open for call: ${this.callSid}`);
             this.isActive = true;
 
-            // Trigger the agent to speak first immediately on connect
+            // Discard pre-greeting audio — it is all line noise from call setup.
+            // Real caller words only come after they hear the greeting.
+            this.pendingAudio = [];
+
             this.sessionPromise.then(session => {
               const hour = new Date().getHours();
-              const greeting =
-                hour < 12 ? 'Good morning'
-                  : hour < 17 ? 'Good afternoon'
-                    : 'Good evening';
+              const timeOfDay =
+                hour < 12 ? 'morning'
+                : hour < 17 ? 'afternoon'
+                : 'evening';
 
-              session.sendRealtimeInput([{
-                text: `[START_CALL] ${greeting}. Begin your opening greeting immediately.`
-              }]);
+              // ── FIX: Greeting ────────────────────────────────────────────
+              // sendRealtimeInput({text}) does NOT reliably trigger audio
+              // output from the native audio model — it processes streaming
+              // media, not conversation turns.
+              //
+              // sendClientContent() injects a proper conversation turn that
+              // the model must respond to, guaranteeing the greeting fires.
+              session.sendClientContent({
+                turns: [{
+                  role: 'user',
+                  parts: [{
+                    text: `[CALL_START] Good ${timeOfDay}. Deliver your opening greeting to the caller now.`
+                  }]
+                }],
+                turnComplete: true
+              });
             });
           },
 
@@ -108,13 +153,18 @@ class GeminiSession {
 
   // ── Called by Peter 1 for every audio chunk from the caller ──────────
 
-  onAudio(base64Pcm16kChunk) {
-    if (!this.isActive || !this.session) return;
+  receiveAudio(base64Pcm16kChunk) {
+    // Buffer if session not ready yet (Red Team #8).
+    // These chunks are cleared at onopen — see above.
+    if (!this.isActive || !this.session) {
+      this.pendingAudio.push(base64Pcm16kChunk);
+      return;
+    }
     try {
       this.session.sendRealtimeInput({
-        media: {
-          mimeType: 'audio/pcm;rate=16000',
-          data: base64Pcm16kChunk
+        audio: {
+          data: base64Pcm16kChunk,
+          mimeType: 'audio/pcm;rate=16000'
         }
       });
     } catch (err) {
@@ -124,44 +174,44 @@ class GeminiSession {
 
   // ── Called by Peter 1 when the call ends ─────────────────────────────
 
-  close() {
+  stop() {
     this._cleanup();
   }
 
   // ── Internal: handles all incoming Gemini server messages ────────────
 
   async _handleMessage(msg) {
-    // Handle audio interruption (customer talks over agent)
     if (msg.serverContent?.interrupted) {
-      // Nothing to do server-side — Peter 1 handles audio queue clearing
       return;
     }
 
-    // Handle audio response from Gemini → forward to Peter 1 → caller
-    const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-    if (audioData && this.onAudioResponse) {
-      this.onAudioResponse(audioData);
+    // Forward all audio parts to Peter 1
+    const parts = msg.serverContent?.modelTurn?.parts;
+    if (parts && this.onAudioResponse) {
+      for (const part of parts) {
+        if (part?.inlineData?.data) {
+          this.onAudioResponse(part.inlineData.data);
+        }
+      }
     }
 
-    // Handle tool calls fired by Gemini
     if (msg.toolCall) {
       await this._handleToolCalls(msg.toolCall.functionCalls);
     }
 
-    // Accumulate output transcript for transfer phrase detection
+    // Red Team #9 — accumulate persistently, never reset
     if (msg.serverContent?.outputTranscription?.text) {
       this.outputTranscript += msg.serverContent.outputTranscription.text;
     }
 
-    // On turn complete — scan transcript for transfer trigger
     if (msg.serverContent?.turnComplete) {
-      if (this.outputTranscript.includes(TRANSFER_PHRASE)) {
+      if (!this.transferTriggered && this.outputTranscript.includes(TRANSFER_PHRASE)) {
+        this.transferTriggered = true;
         console.log(`Transfer phrase detected on call: ${this.callSid}`);
         if (this.onTransferRequested) {
           this.onTransferRequested(TRANSFER_NUMBER);
         }
       }
-      this.outputTranscript = ''; // Reset for next turn
     }
   }
 
@@ -178,10 +228,9 @@ class GeminiSession {
       } else if (fc.name === 'completeOrder') {
         result = await handleCompleteOrder(this.callSid, fc.args);
 
-        // Schedule session end 12 seconds after confirmed order
-        // (gives agent time to say farewell)
+        // Red Team #10 — 22s for full farewell (shortened in systemPrompt)
         if (result.orderId) {
-          setTimeout(() => this._cleanup(), 12000);
+          setTimeout(() => this._cleanup(), 22000);
         }
       }
 
@@ -192,7 +241,6 @@ class GeminiSession {
       });
     }
 
-    // Send all tool responses back to Gemini in a single call
     if (this.session && responses.length > 0) {
       try {
         this.session.sendToolResponse({ functionResponses: responses });
@@ -208,9 +256,10 @@ class GeminiSession {
     if (!this.isActive) return;
 
     this.isActive = false;
+    this.pendingAudio = [];
 
     if (this.session) {
-      try { this.session.close(); } catch (e) { }
+      try { this.session.close(); } catch (e) {}
       this.session = null;
     }
 

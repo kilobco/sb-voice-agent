@@ -42,20 +42,24 @@ const manageOrderTool = {
 const completeOrderTool = {
   name: 'completeOrder',
   description:
-    'Finalize and confirm the order. Call this ONLY after the customer has ' +
-    'said yes to the order confirmation AND provided their name and phone number. ' +
-    'This writes the order to the database. ' +
-    'Do not call this until you have BOTH name and phone number.',
+    'Finalize and write the order to the database. ' +
+    'STRICT PRECONDITIONS — all three must be true before calling this: ' +
+    '(1) Customer verbally said yes to the order summary. ' +
+    '(2) Customer verbally said their name and you confirmed it back. ' +
+    '(3) Customer verbally said their phone number and you read it back digit by digit and they confirmed it. ' +
+    'NEVER call this with a guessed, assumed, or placeholder name or number. ' +
+    'NEVER use the caller ID as the phone number. ' +
+    'If you do not yet have both values from the customer\'s own mouth, ask for them first.',
   parameters: {
     type: Type.OBJECT,
     properties: {
       customerName: {
         type: Type.STRING,
-        description: 'The full name of the customer for pickup.'
+        description: 'The exact name the customer said out loud for their pickup order.'
       },
       phoneNumber: {
         type: Type.STRING,
-        description: 'The phone number of the customer. Include country code if provided.'
+        description: 'The phone number the customer said out loud and confirmed. Digits only, no dashes.'
       }
     },
     required: ['customerName', 'phoneNumber']
