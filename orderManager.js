@@ -443,6 +443,100 @@ async function handleCompleteOrder(callSid, args) {
   }
 }
 
+// ── searchMenu — fuzzy match against PRICE_MAP ────────────────────────────
+// Called when Gemini fires the searchMenu tool.
+// Scores every item in PRICE_MAP against the query tokens and returns the
+// top matches so the agent always states an authoritative price.
+
+// Category aliases: a spoken word → substrings to match against item names
+const CATEGORY_ALIASES = {
+  'dosa':       ['dosa'],
+  'idly':       ['idly', 'idli'],
+  'idli':       ['idly', 'idli'],
+  'vada':       ['vada'],
+  'uthappam':   ['uthappam'],
+  'bread':      ['naan', 'chapathi', 'parotta', 'poori'],
+  'naan':       ['naan'],
+  'curry':      ['masala', 'mutter', 'paneer', 'gobi', 'aloo', 'jalfrezi', 'butter masala', 'avial', 'rogan'],
+  'rice':       ['rice', 'pulao', 'biryani', 'bisibelabath', 'bagalabath'],
+  'biryani':    ['biryani'],
+  'pulao':      ['pulao'],
+  'beverage':   ['coffee', 'tea', 'lassi', 'juice', 'milk', 'drinks'],
+  'drink':      ['coffee', 'tea', 'lassi', 'juice', 'milk', 'drinks'],
+  'coffee':     ['coffee'],
+  'lassi':      ['lassi'],
+  'dessert':    ['pongal', 'halwa', 'jamun', 'rasamalai', 'kheer', 'kesari'],
+  'sweet':      ['pongal', 'halwa', 'jamun', 'rasamalai', 'kheer', 'kesari'],
+  'appetizer':  ['idly', 'vada', 'bonda', 'pongal', 'rasam', 'kichadi'],
+  'starter':    ['gobi 65', 'manchurian', 'chilli', 'paneer manchurian'],
+  'chinese':    ['manchurian', '65', 'chilli', 'schezwan', 'fried rice'],
+  'combo':      ['combo'],
+  'paneer':     ['paneer'],
+  'millet':     ['millet'],
+  'rava':       ['rava'],
+  'ghee':       ['ghee'],
+  'cheese':     ['cheese'],
+  'mysore':     ['mysore'],
+  'onion':      ['onion'],
+  'masala':     ['masala'],
+};
+
+function searchMenu(query) {
+  if (!query || typeof query !== 'string') {
+    return { results: [], message: 'No query provided.' };
+  }
+
+  const raw = query.toLowerCase().trim();
+  const tokens = raw.split(/\s+/);
+
+  // Expand tokens through category aliases
+  const expandedTerms = new Set(tokens);
+  for (const token of tokens) {
+    if (CATEGORY_ALIASES[token]) {
+      CATEGORY_ALIASES[token].forEach(t => expandedTerms.add(t));
+    }
+  }
+  const terms = Array.from(expandedTerms);
+
+  // Score each item in PRICE_MAP
+  const scored = Object.entries(PRICE_MAP).map(([name, price]) => {
+    const lowerName = name.toLowerCase();
+    let score = 0;
+
+    for (const term of terms) {
+      if (lowerName.includes(term)) {
+        // Longer term matches are worth more (more specific)
+        score += term.length;
+      }
+    }
+
+    // Bonus: exact full-name match
+    if (lowerName === raw) score += 100;
+
+    // Bonus: name starts with the query
+    if (lowerName.startsWith(raw)) score += 20;
+
+    return { name, price, score };
+  });
+
+  // Filter to items with any match, then sort descending by score
+  const matches = scored
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 6); // Return top 6
+
+  if (matches.length === 0) {
+    console.log(`searchMenu: no matches for "${query}"`);
+    return { results: [], message: `No items found matching "${query}".` };
+  }
+
+  console.log(`searchMenu: "${query}" → ${matches.length} results (top: ${matches[0].name} $${matches[0].price})`);
+  return {
+    results: matches.map(m => ({ name: m.name, price: m.price })),
+    message: `Found ${matches.length} item(s) matching "${query}".`
+  };
+}
+
 // ── Called by geminiSession.js when the call ends ─────────────────────────
 
 function deleteSession(callSid) {
@@ -453,8 +547,9 @@ function deleteSession(callSid) {
 module.exports = {
   createSession,
   getSession,
+  searchMenu,
   handleManageOrder,
+  collectCustomerDetails,
   handleCompleteOrder,
-  deleteSession,
-  collectCustomerDetails
+  deleteSession
 };

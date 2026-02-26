@@ -1,9 +1,32 @@
 // toolDefinitions.js
-// Gemini function declarations for manageOrder and completeOrder
+// Gemini function declarations for searchMenu, manageOrder, collectCustomerDetails, completeOrder.
 // These schemas tell Gemini when to call a function and what arguments to pass.
 // DO NOT rename these functions — Peter 1's server.js depends on exact names.
 
 const { Type } = require('@google/genai');
+
+const searchMenuTool = {
+  name: 'searchMenu',
+  description:
+    'Look up items on the Saravanaa Bhavan menu by name or category. ' +
+    'CALL THIS BEFORE EVERY manageOrder call — never add an item without first confirming ' +
+    'its name and price via this tool. ' +
+    'Also call this when the customer asks what is available in a category (e.g. "what dosas do you have?"). ' +
+    'Before calling this tool, always say out loud: "Let me check that for you." ' +
+    'Use the exact name and price from the result when calling manageOrder.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      query: {
+        type: Type.STRING,
+        description:
+          'The item name or category to search for. ' +
+          'Examples: "Masala Dosa", "dosa", "beverage", "paneer curry", "Filter Coffee".'
+      }
+    },
+    required: ['query']
+  }
+};
 
 const manageOrderTool = {
   name: 'manageOrder',
@@ -88,6 +111,6 @@ const completeOrderTool = {
   }
 };
 
-const tools = [{ functionDeclarations: [manageOrderTool, collectCustomerDetailsTool, completeOrderTool] }];
+const tools = [{ functionDeclarations: [searchMenuTool, manageOrderTool, collectCustomerDetailsTool, completeOrderTool] }];
 
 module.exports = { tools };
