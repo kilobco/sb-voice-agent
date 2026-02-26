@@ -115,6 +115,7 @@ class GeminiSession {
             this._cleanup();
           },
 
+          
           onerror: (e) => {
             console.error(`Gemini session error for call: ${this.callSid}`, e);
             this._cleanup();
