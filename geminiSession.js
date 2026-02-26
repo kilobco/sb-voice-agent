@@ -14,7 +14,7 @@ require('dotenv').config();
 
 // Red Team #6 — Modality enum intentionally NOT imported.
 // Use raw string 'AUDIO' to avoid undefined errors across SDK versions.
-const { GoogleGenAI } = require('@google/genai');
+const { GoogleGenAI, Type } = require('@google/genai');
 const { SYSTEM_PROMPT } = require('./systemPrompt');
 const { tools } = require('./toolDefinitions');
 const {
@@ -29,6 +29,41 @@ const {
 const MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
 const TRANSFER_PHRASE = 'TRANSFER_TO_HUMAN';
 const TRANSFER_NUMBER = process.env.RESTAURANT_TRANSFER_NUMBER;
+
+function safeJson(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (err) {
+    return JSON.stringify({
+      _nonSerializable: true,
+      type: typeof value,
+      error: err?.message || String(err),
+    });
+  }
+}
+
+function redactToolArgs(args) {
+  if (!args || typeof args !== 'object') return args;
+  const out = { ...args };
+  if (typeof out.phoneNumber === 'string') {
+    const digits = out.phoneNumber.replace(/\D/g, '');
+    out.phoneNumber = digits.length > 4 ? `***${digits.slice(-4)}` : '***';
+  }
+  if (typeof out.customerName === 'string') {
+    out.customerName = out.customerName.length ? `${out.customerName[0]}***` : '***';
+  }
+  return out;
+}
+
+function buildToolSchemaIndex() {
+  const decls = tools?.[0]?.functionDeclarations;
+  if (!Array.isArray(decls)) return new Map();
+  const m = new Map();
+  for (const d of decls) {
+    if (d?.name) m.set(d.name, d);
+  }
+  return m;
+}
 
 class GeminiSession {
   constructor({ callSid, callDbId, onAudioResponse, onTransferRequested, onSessionEnded }) {
@@ -65,6 +100,9 @@ class GeminiSession {
     this.retryCount = 0;
     this._retrying = false;
     this.greetingSent = false;
+
+    // Tool schema cache (used for validation + logging only)
+    this._toolDecls = buildToolSchemaIndex();
   }
 
   // ── Called by Peter 1 when the call connects ──────────────────────────
@@ -112,23 +150,45 @@ class GeminiSession {
 
                 this.greetingSent = true;
 
-                session.sendClientContent({
+                const greetingPayload = {
                   turns: [{
                     role: 'user',
-                    parts: [{ text: `[START_CALL] ${greeting}. Begin your opening greeting immediately.` }]
+                    parts: [{ text: `[START_CALL] ${greeting}. Begin your opening greeting immediately.` }],
                   }],
-                  turnComplete: true
-                });
+                  turnComplete: true,
+                };
+
+                try {
+                  session.sendClientContent(greetingPayload);
+                } catch (err) {
+                  console.error(
+                    `[${this.callSid}] sendClientContent(greeting) threw:`,
+                    err?.message || err,
+                    '| payload:',
+                    safeJson(greetingPayload)
+                  );
+                }
               });
             }, 500);
           },
 
           onmessage: async (msg) => {
+            // Capture raw Gemini payloads for debugging 1008/1011 causes.
+            // This is intentionally verbose; it helps correlate failures with specific server messages.
+            if (msg?.error || msg?.serverContent?.error || msg?.setup?.error) {
+              console.error(`[${this.callSid}] Gemini message contains error:`, safeJson(msg));
+            }
             await this._handleMessage(msg);
           },
 
           onclose: (e) => {
-            console.log(`Gemini session closed for call: ${this.callSid}`, e?.code);
+            const closeInfo = {
+              code: e?.code,
+              reason: e?.reason,
+              wasClean: e?.wasClean,
+              type: e?.type,
+            };
+            console.log(`Gemini session closed for call: ${this.callSid}`, closeInfo, '| raw:', safeJson(e));
 
             // Fix: if we get a 1011 before the greeting was ever sent, it's
             // likely a server-side init race. Retry up to 2 times.
@@ -146,7 +206,15 @@ class GeminiSession {
           },
 
           onerror: (e) => {
-            console.error(`Gemini session error for call: ${this.callSid}`, e);
+            console.error(
+              `Gemini session error for call: ${this.callSid}`,
+              '| raw:',
+              safeJson(e),
+              '| message:',
+              e?.message,
+              '| code:',
+              e?.code
+            );
             this._cleanup();
           }
         }
@@ -251,6 +319,9 @@ class GeminiSession {
       let result;
 
       try {
+        // Log tool call details + validate args against toolDefinitions.js schema.
+        this._logAndValidateToolCall(fc);
+
         if (fc.name === 'searchMenu') {
           // Synchronous — just searches the in-memory PRICE_MAP
           result = searchMenu(fc.args?.query);
@@ -287,6 +358,13 @@ class GeminiSession {
         result = { result: 'Sorry, there was a brief error. Please try again.' };
       }
 
+      // Log tool response shape (helps debug 1008 policy/protocol closures)
+      if (result === null || result === undefined) {
+        console.warn(`[${this.callSid}] Tool "${fc.name}" returned ${result} (will still sendToolResponse)`);
+      } else if (typeof result !== 'object') {
+        console.warn(`[${this.callSid}] Tool "${fc.name}" returned non-object (${typeof result}):`, result);
+      }
+
       responses.push({
         id: fc.id,
         name: fc.name,
@@ -299,9 +377,17 @@ class GeminiSession {
     // Use snapshot — this.session may be null if caller hung up during await
     if (sessionSnapshot && responses.length > 0 && !this.wasInterrupted) {
       try {
+        // Emit a compact summary of what we're about to send.
+        const summary = responses.map(r => ({
+          id: r.id,
+          name: r.name,
+          responseType: typeof r.response,
+          responseKeys: (r.response && typeof r.response === 'object') ? Object.keys(r.response).slice(0, 12) : [],
+        }));
+        console.log(`[${this.callSid}] sendToolResponse(functionResponses) summary:`, safeJson(summary));
         sessionSnapshot.sendToolResponse({ functionResponses: responses });
       } catch (err) {
-        console.error(`[${this.callSid}] sendToolResponse error:`, err.message);
+        console.error(`[${this.callSid}] sendToolResponse error:`, err?.message || err, '| responses:', safeJson(responses));
       }
     } else if (this.wasInterrupted) {
       console.log(`[${this.callSid}] Tool call was interrupted — skipping sendToolResponse`);
@@ -331,6 +417,62 @@ class GeminiSession {
     }
 
     console.log(`GeminiSession cleaned up for call: ${this.callSid}`);
+  }
+
+  _logAndValidateToolCall(fc) {
+    const name = fc?.name || 'unknown';
+    const id = fc?.id;
+    const args = fc?.args;
+
+    console.log(
+      `[${this.callSid}] Tool call received:`,
+      safeJson({ id, name, args: redactToolArgs(args) })
+    );
+
+    const decl = this._toolDecls.get(name);
+    if (!decl?.parameters) {
+      console.warn(`[${this.callSid}] No tool schema found for "${name}" (cannot validate args)`);
+      return;
+    }
+
+    if (!args || typeof args !== 'object') {
+      console.warn(`[${this.callSid}] Tool "${name}" args is not an object:`, safeJson(args));
+      return;
+    }
+
+    const schemaProps = decl.parameters?.properties || {};
+    const required = Array.isArray(decl.parameters?.required) ? decl.parameters.required : [];
+
+    // Missing required fields
+    for (const key of required) {
+      if (!(key in args)) {
+        console.warn(`[${this.callSid}] Tool "${name}" missing required arg "${key}" | args:`, safeJson(redactToolArgs(args)));
+      }
+    }
+
+    // Type checks + unexpected fields
+    for (const [k, v] of Object.entries(args)) {
+      if (!schemaProps[k]) {
+        console.warn(`[${this.callSid}] Tool "${name}" received unexpected arg "${k}" | valueType: ${typeof v}`);
+        continue;
+      }
+
+      const expectedType = schemaProps[k]?.type;
+      if (expectedType === Type.STRING && typeof v !== 'string') {
+        console.warn(`[${this.callSid}] Tool "${name}" arg "${k}" expected STRING but got ${typeof v} | value:`, safeJson(v));
+      }
+      if (expectedType === Type.NUMBER && typeof v !== 'number') {
+        console.warn(`[${this.callSid}] Tool "${name}" arg "${k}" expected NUMBER but got ${typeof v} | value:`, safeJson(v));
+      }
+      if (expectedType === Type.INTEGER) {
+        if (typeof v !== 'number' || !Number.isInteger(v)) {
+          console.warn(`[${this.callSid}] Tool "${name}" arg "${k}" expected INTEGER but got ${typeof v} | value:`, safeJson(v));
+        }
+      }
+      if (expectedType === Type.OBJECT && (typeof v !== 'object' || v === null || Array.isArray(v))) {
+        console.warn(`[${this.callSid}] Tool "${name}" arg "${k}" expected OBJECT but got ${typeof v} | value:`, safeJson(v));
+      }
+    }
   }
 }
 
