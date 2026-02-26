@@ -95,6 +95,11 @@ class GeminiSession {
     // cancelled call — doing so causes the server-side 1011.
     this.wasInterrupted = false;
 
+    // Barge-in: track whether the agent is currently speaking.
+    // When Gemini sends interrupted, we gate onAudioResponse immediately so
+    // buffered audio chunks stop reaching the caller's ear.
+    this.agentSpeaking = false;
+
     // Fix: early 1011 on session open — sendClientContent fired too quickly.
     // Retry up to 2 times before giving up and cleaning up.
     this.retryCount = 0;
@@ -127,7 +132,26 @@ class GeminiSession {
           systemInstruction: SYSTEM_PROMPT,
           tools: tools,
           outputAudioTranscription: {},
-          inputAudioTranscription: {}
+          inputAudioTranscription: {},
+          // Barge-in / interruption tuning for phone audio.
+          // Phone calls via Twilio have more background noise than browser mics,
+          // so the default VAD sensitivity is too conservative — it misses the
+          // customer speaking over the agent. These settings make it fire faster:
+          //   START_SENSITIVITY_HIGH  — trigger speech detection sooner
+          //   END_SENSITIVITY_LOW     — don't cut off mid-sentence after a pause
+          //   silenceDurationMs 600   — wait 600ms of silence before end-of-turn
+          //                            (handles "uh", "umm", natural pauses)
+          //   prefixPaddingMs 200     — include 200ms before speech onset so
+          //                            the first word is never clipped
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              disabled: false,
+              startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+              endOfSpeechSensitivity:   'END_SENSITIVITY_LOW',
+              prefixPaddingMs:          200,
+              silenceDurationMs:        600,
+            }
+          },
         },
         callbacks: {
           onopen: () => {
@@ -265,19 +289,28 @@ class GeminiSession {
   // ── Internal: handles all incoming Gemini server messages ────────────
 
   async _handleMessage(msg) {
-    // Fix: VAD interrupted — a pending tool call was cancelled by Gemini.
-    // Set the flag so _handleToolCalls knows NOT to call sendToolResponse.
+    // Barge-in: user spoke over the agent. Gemini cancels its current turn.
+    // Set wasInterrupted so tool calls don't fire sendToolResponse.
+    // Clear agentSpeaking so audio forwarding stops immediately — any buffered
+    // chunks queued after this point are dropped, cutting audio to the caller.
     if (msg.serverContent?.interrupted) {
       this.wasInterrupted = true;
+      this.agentSpeaking = false;
+      console.log(`[${this.callSid}] Barge-in detected — agent audio cut`);
       return;
     }
 
-    // FIX: Iterate ALL parts — Gemini may spread audio across multiple parts
+    // Forward agent audio to caller only while agentSpeaking is true.
+    // agentSpeaking is set true when the first audio part arrives in a turn,
+    // and cleared on interrupt (above) or turnComplete (below).
     const parts = msg.serverContent?.modelTurn?.parts;
     if (parts && this.onAudioResponse) {
       for (const part of parts) {
         if (part?.inlineData?.data) {
-          this.onAudioResponse(part.inlineData.data);
+          this.agentSpeaking = true; // agent has started speaking this turn
+          if (this.agentSpeaking) {  // gate: drop chunks if interrupted mid-batch
+            this.onAudioResponse(part.inlineData.data);
+          }
         }
       }
     }
@@ -293,6 +326,7 @@ class GeminiSession {
     }
 
     if (msg.serverContent?.turnComplete) {
+      this.agentSpeaking = false; // agent finished speaking — reset for next turn
       if (!this.transferTriggered && this.outputTranscript.includes(TRANSFER_PHRASE)) {
         this.transferTriggered = true;
         console.log(`Transfer phrase detected on call: ${this.callSid}`);
