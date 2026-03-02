@@ -25,7 +25,7 @@ const {
   deleteSession
 } = require('./orderManager');
 
-const MODEL = 'gemini-2.5-flash-native-audio-preview-09-2025';
+const MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
 const TRANSFER_PHRASE = 'TRANSFER_TO_HUMAN';
 const TRANSFER_NUMBER = process.env.RESTAURANT_TRANSFER_NUMBER;
 
