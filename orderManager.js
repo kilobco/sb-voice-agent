@@ -7,7 +7,6 @@
 // process.env is shared across all requires — no need to call config() here.
 
 const { createClient } = require('@supabase/supabase-js');
-const { pushOrderToClover } = require('./cloverClient');
 
 // Lazy Supabase client — only initialised when completeOrder fires.
 // This lets the Gemini session run and be tested without Supabase credentials.
@@ -420,15 +419,7 @@ async function handleCompleteOrder(callSid, args) {
 
       console.log(`✓ Order confirmed: ${orderNumber} | Total: $${total} | Customer: ${customerName}`);
 
-      // Push to Clover POS (non-blocking — Supabase is source of truth)
-      let cloverOrderId = null;
-      try {
-        cloverOrderId = await pushOrderToClover(cart, customerName, total);
-      } catch (cloverErr) {
-        console.error('Clover push failed (non-fatal):', cloverErr.message);
-      }
-
-      return { order, orderNumber, total, cloverOrderId };
+      return { order, orderNumber, total };
     });
 
     // 6. Clear cart after successful order (outside retry so it only happens once)
@@ -446,7 +437,7 @@ async function handleCompleteOrder(callSid, args) {
     console.error('handleCompleteOrder failed after 3 attempts:', err.message);
     return {
       result: 'I am sorry, there is a brief system issue. Your order has been noted. ' +
-        'Please call us back in 2 minutes and we will get it placed immediately.',
+              'Please call us back in 2 minutes and we will get it placed immediately.',
       orderId: null
     };
   }
