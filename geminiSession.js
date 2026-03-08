@@ -14,56 +14,20 @@ require('dotenv').config();
 
 // Red Team #6 — Modality enum intentionally NOT imported.
 // Use raw string 'AUDIO' to avoid undefined errors across SDK versions.
-const { GoogleGenAI, Type } = require('@google/genai');
+const { GoogleGenAI } = require('@google/genai');
 const { SYSTEM_PROMPT } = require('./systemPrompt');
 const { tools } = require('./toolDefinitions');
 const {
   createSession,
-  searchMenu,
   handleManageOrder,
   collectCustomerDetails,
   handleCompleteOrder,
   deleteSession
 } = require('./orderManager');
 
-const MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
+const MODEL = 'gemini-2.5-flash-native-audio-preview-09-2025';
 const TRANSFER_PHRASE = 'TRANSFER_TO_HUMAN';
 const TRANSFER_NUMBER = process.env.RESTAURANT_TRANSFER_NUMBER;
-
-function safeJson(value) {
-  try {
-    return JSON.stringify(value);
-  } catch (err) {
-    return JSON.stringify({
-      _nonSerializable: true,
-      type: typeof value,
-      error: err?.message || String(err),
-    });
-  }
-}
-
-function redactToolArgs(args) {
-  if (!args || typeof args !== 'object') return args;
-  const out = { ...args };
-  if (typeof out.phoneNumber === 'string') {
-    const digits = out.phoneNumber.replace(/\D/g, '');
-    out.phoneNumber = digits.length > 4 ? `***${digits.slice(-4)}` : '***';
-  }
-  if (typeof out.customerName === 'string') {
-    out.customerName = out.customerName.length ? `${out.customerName[0]}***` : '***';
-  }
-  return out;
-}
-
-function buildToolSchemaIndex() {
-  const decls = tools?.[0]?.functionDeclarations;
-  if (!Array.isArray(decls)) return new Map();
-  const m = new Map();
-  for (const d of decls) {
-    if (d?.name) m.set(d.name, d);
-  }
-  return m;
-}
 
 class GeminiSession {
   constructor({ callSid, callDbId, onAudioResponse, onTransferRequested, onSessionEnded }) {
@@ -79,40 +43,23 @@ class GeminiSession {
     this.sessionPromise = null;
     this.isActive = false;
 
-    // Red Team #9 — Persistent transcript across all turns, never reset mid-session.
+    // Red Team #8 — Buffer audio arriving before Gemini session is ready.
+    // Cleared (not flushed) at greeting time — pre-greeting audio is line noise.
+    this.pendingAudio = [];
+
+    // Red Team #9 — Persistent transcript across all turns, never reset.
     this.outputTranscript = '';
     this.transferTriggered = false;
 
     // Order lock — prevents close() from killing session mid-completeOrder.
     this.orderInProgress = false;
-
-    // Fix: pause audio forwarding while a tool call is in flight to prevent
-    // simultaneous audio + tool response writes that can cause 1011.
-    this.toolCallInProgress = false;
-
-    // Fix: VAD can cancel a pending tool call mid-flight. When Gemini sends
-    // the interrupted message, we must NOT send sendToolResponse for that
-    // cancelled call — doing so causes the server-side 1011.
-    this.wasInterrupted = false;
-
-    // Fix: early 1011 on session open — sendClientContent fired too quickly.
-    // Retry up to 2 times before giving up and cleaning up.
-    this.retryCount = 0;
-    this._retrying = false;
-    this.greetingSent = false;
-
-    // Tool schema cache (used for validation + logging only)
-    this._toolDecls = buildToolSchemaIndex();
   }
 
   // ── Called by Peter 1 when the call connects ──────────────────────────
 
   async start() {
     try {
-      // Create the in-memory cart for this call (only on first start, not retries)
-      if (!this._retrying) {
-        createSession(this.callSid, this.callDbId);
-      }
+      createSession(this.callSid, this.callDbId);
 
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -134,87 +81,43 @@ class GeminiSession {
             console.log(`Gemini session open for call: ${this.callSid}`);
             this.isActive = true;
 
-            // Fix: wait 500ms after WebSocket open before triggering greeting.
-            // Sending too quickly causes a 1011 before Gemini is ready.
-            setTimeout(() => {
-              if (!this.isActive) return; // session may have closed during the wait
+            // Discard pre-greeting audio — it is all line noise from call setup.
+            this.pendingAudio = [];
 
-              this.sessionPromise.then(session => {
-                if (!this.isActive) return;
+            // Trigger the agent to speak its opening line immediately
+            this.sessionPromise.then(session => {
+              const hour = new Date().getHours();
+              const timeOfDay =
+                hour < 12 ? 'morning'
+                : hour < 17 ? 'afternoon'
+                : 'evening';
 
-                const hour = new Date().getHours();
-                const greeting =
-                  hour < 12 ? 'Good morning'
-                    : hour < 17 ? 'Good afternoon'
-                      : 'Good evening';
-
-                this.greetingSent = true;
-
-                const greetingPayload = {
-                  turns: [{
-                    role: 'user',
-                    parts: [{ text: `[START_CALL] ${greeting}. Begin your opening greeting immediately.` }],
-                  }],
-                  turnComplete: true,
-                };
-
-                try {
-                  session.sendClientContent(greetingPayload);
-                } catch (err) {
-                  console.error(
-                    `[${this.callSid}] sendClientContent(greeting) threw:`,
-                    err?.message || err,
-                    '| payload:',
-                    safeJson(greetingPayload)
-                  );
-                }
+              // sendClientContent injects a proper conversation turn that
+              // the model must respond to, guaranteeing the greeting fires.
+              session.sendClientContent({
+                turns: [{
+                  role: 'user',
+                  parts: [{
+                    text: `[CALL_START] Good ${timeOfDay}. Deliver your opening greeting to the caller now.`
+                  }]
+                }],
+                turnComplete: true
               });
-            }, 500);
+            });
           },
 
           onmessage: async (msg) => {
-            // Capture raw Gemini payloads for debugging 1008/1011 causes.
-            // This is intentionally verbose; it helps correlate failures with specific server messages.
-            if (msg?.error || msg?.serverContent?.error || msg?.setup?.error) {
-              console.error(`[${this.callSid}] Gemini message contains error:`, safeJson(msg));
-            }
             await this._handleMessage(msg);
           },
 
           onclose: (e) => {
-            const closeInfo = {
-              code: e?.code,
-              reason: e?.reason,
-              wasClean: e?.wasClean,
-              type: e?.type,
-            };
-            console.log(`Gemini session closed for call: ${this.callSid}`, closeInfo, '| raw:', safeJson(e));
-
-            // Fix: if we get a 1011 before the greeting was ever sent, it's
-            // likely a server-side init race. Retry up to 2 times.
-            if (e?.code === 1011 && !this.greetingSent && this.retryCount < 2) {
-              this.retryCount++;
-              console.log(`[${this.callSid}] 1011 before greeting — retry attempt ${this.retryCount}`);
-              this.session = null;
-              this.sessionPromise = null;
-              this.isActive = false;
-              this._retrying = true;
-              setTimeout(() => this.start(), 1000);
-            } else {
-              this._cleanup();
-            }
+            console.log(`Gemini session closed for call: ${this.callSid}`, e?.code);
+            this._cleanup();
           },
 
+          
           onerror: (e) => {
-            console.error(
-              `Gemini session error for call: ${this.callSid}`,
-              '| raw:',
-              safeJson(e),
-              '| message:',
-              e?.message,
-              '| code:',
-              e?.code
-            );
+            console.error(`Gemini session error for call: ${this.callSid}`, e);
             this._cleanup();
           }
         }
@@ -232,12 +135,14 @@ class GeminiSession {
   // server.js calls this as: session.geminiSession.onAudio(chunk)
 
   onAudio(base64Pcm16kChunk) {
-    // Fix: do not forward audio while a tool call is in progress.
-    // Concurrent writes cause 1011.
-    if (!this.isActive || !this.session || this.toolCallInProgress) return;
+    // Red Team #8 — Buffer if session not ready yet
+    if (!this.isActive || !this.session) {
+      this.pendingAudio.push(base64Pcm16kChunk);
+      return;
+    }
     try {
+      // FIX: JS SDK uses audio:{data,mimeType} not media:{mimeType,data}
       this.session.sendRealtimeInput({
-        // FIX: JS SDK uses audio:{data,mimeType} not media:{mimeType,data}
         audio: {
           data: base64Pcm16kChunk,
           mimeType: 'audio/pcm;rate=16000'
@@ -265,10 +170,7 @@ class GeminiSession {
   // ── Internal: handles all incoming Gemini server messages ────────────
 
   async _handleMessage(msg) {
-    // Fix: VAD interrupted — a pending tool call was cancelled by Gemini.
-    // Set the flag so _handleToolCalls knows NOT to call sendToolResponse.
     if (msg.serverContent?.interrupted) {
-      this.wasInterrupted = true;
       return;
     }
 
@@ -282,12 +184,11 @@ class GeminiSession {
       }
     }
 
-    // Handle tool calls fired by Gemini
     if (msg.toolCall) {
       await this._handleToolCalls(msg.toolCall.functionCalls);
     }
 
-    // Red Team #9 — accumulate persistently for transfer detection
+    // Red Team #9 — accumulate persistently, never reset
     if (msg.serverContent?.outputTranscription?.text) {
       this.outputTranscript += msg.serverContent.outputTranscription.text;
     }
@@ -304,12 +205,9 @@ class GeminiSession {
     }
   }
 
-  // ── Internal: handles all tool calls from Gemini ──────────────────────
+  // ── Internal: handles manageOrder and completeOrder tool calls ────────
 
   async _handleToolCalls(functionCalls) {
-    // Fix: block audio forwarding while tool calls are in flight
-    this.toolCallInProgress = true;
-
     const responses = [];
 
     // Snapshot session ref before any awaits — close() may null this.session
@@ -318,51 +216,27 @@ class GeminiSession {
     for (const fc of functionCalls) {
       let result;
 
-      try {
-        // Log tool call details + validate args against toolDefinitions.js schema.
-        this._logAndValidateToolCall(fc);
+      if (fc.name === 'manageOrder') {
+        result = handleManageOrder(this.callSid, fc.args);
 
-        if (fc.name === 'searchMenu') {
-          // Synchronous — just searches the in-memory PRICE_MAP
-          result = searchMenu(fc.args?.query);
+      } else if (fc.name === 'collectCustomerDetails') {
+        result = collectCustomerDetails(this.callSid, fc.args);
 
-        } else if (fc.name === 'manageOrder') {
-          result = handleManageOrder(this.callSid, fc.args);
+      } else if (fc.name === 'completeOrder') {
+        this.orderInProgress = true;
+        console.log(`[${this.callSid}] completeOrder started — order lock acquired`);
 
-        } else if (fc.name === 'collectCustomerDetails') {
-          result = collectCustomerDetails(this.callSid, fc.args);
-
-        } else if (fc.name === 'completeOrder') {
-          this.orderInProgress = true;
-          console.log(`[${this.callSid}] completeOrder started — order lock acquired`);
-
-          try {
-            result = await handleCompleteOrder(this.callSid, fc.args);
-          } finally {
-            this.orderInProgress = false;
-            console.log(`[${this.callSid}] completeOrder finished — order lock released`);
-          }
-
-          // Red Team #10 — 22s for full farewell after confirmed order
-          if (result?.orderId) {
-            setTimeout(() => this._cleanup(), 22000);
-          }
-
-        } else {
-          // Unknown tool — return a safe fallback so Gemini isn't left hanging
-          console.warn(`[${this.callSid}] Unknown tool called: ${fc.name}`);
-          result = { result: `Tool "${fc.name}" is not available.` };
+        try {
+          result = await handleCompleteOrder(this.callSid, fc.args);
+        } finally {
+          this.orderInProgress = false;
+          console.log(`[${this.callSid}] completeOrder finished — order lock released`);
         }
-      } catch (err) {
-        console.error(`[${this.callSid}] Tool "${fc.name}" threw:`, err.message);
-        result = { result: 'Sorry, there was a brief error. Please try again.' };
-      }
 
-      // Log tool response shape (helps debug 1008 policy/protocol closures)
-      if (result === null || result === undefined) {
-        console.warn(`[${this.callSid}] Tool "${fc.name}" returned ${result} (will still sendToolResponse)`);
-      } else if (typeof result !== 'object') {
-        console.warn(`[${this.callSid}] Tool "${fc.name}" returned non-object (${typeof result}):`, result);
+        // Red Team #10 — 22s for full farewell
+        if (result.orderId) {
+          setTimeout(() => this._cleanup(), 22000);
+        }
       }
 
       responses.push({
@@ -372,30 +246,14 @@ class GeminiSession {
       });
     }
 
-    // Fix: if Gemini sent an interrupted message while we were awaiting,
-    // do NOT call sendToolResponse — it will cause a 1011.
     // Use snapshot — this.session may be null if caller hung up during await
-    if (sessionSnapshot && responses.length > 0 && !this.wasInterrupted) {
+    if (sessionSnapshot && responses.length > 0) {
       try {
-        // Emit a compact summary of what we're about to send.
-        const summary = responses.map(r => ({
-          id: r.id,
-          name: r.name,
-          responseType: typeof r.response,
-          responseKeys: (r.response && typeof r.response === 'object') ? Object.keys(r.response).slice(0, 12) : [],
-        }));
-        console.log(`[${this.callSid}] sendToolResponse(functionResponses) summary:`, safeJson(summary));
         sessionSnapshot.sendToolResponse({ functionResponses: responses });
       } catch (err) {
-        console.error(`[${this.callSid}] sendToolResponse error:`, err?.message || err, '| responses:', safeJson(responses));
+        console.error('sendToolResponse error:', err.message);
       }
-    } else if (this.wasInterrupted) {
-      console.log(`[${this.callSid}] Tool call was interrupted — skipping sendToolResponse`);
     }
-
-    // Reset flags for next turn
-    this.wasInterrupted = false;
-    this.toolCallInProgress = false;
   }
 
   // ── Internal: close Gemini session and clean up state ─────────────────
@@ -404,6 +262,7 @@ class GeminiSession {
     if (!this.isActive) return;
 
     this.isActive = false;
+    this.pendingAudio = [];
 
     if (this.session) {
       try { this.session.close(); } catch (e) {}
@@ -417,62 +276,6 @@ class GeminiSession {
     }
 
     console.log(`GeminiSession cleaned up for call: ${this.callSid}`);
-  }
-
-  _logAndValidateToolCall(fc) {
-    const name = fc?.name || 'unknown';
-    const id = fc?.id;
-    const args = fc?.args;
-
-    console.log(
-      `[${this.callSid}] Tool call received:`,
-      safeJson({ id, name, args: redactToolArgs(args) })
-    );
-
-    const decl = this._toolDecls.get(name);
-    if (!decl?.parameters) {
-      console.warn(`[${this.callSid}] No tool schema found for "${name}" (cannot validate args)`);
-      return;
-    }
-
-    if (!args || typeof args !== 'object') {
-      console.warn(`[${this.callSid}] Tool "${name}" args is not an object:`, safeJson(args));
-      return;
-    }
-
-    const schemaProps = decl.parameters?.properties || {};
-    const required = Array.isArray(decl.parameters?.required) ? decl.parameters.required : [];
-
-    // Missing required fields
-    for (const key of required) {
-      if (!(key in args)) {
-        console.warn(`[${this.callSid}] Tool "${name}" missing required arg "${key}" | args:`, safeJson(redactToolArgs(args)));
-      }
-    }
-
-    // Type checks + unexpected fields
-    for (const [k, v] of Object.entries(args)) {
-      if (!schemaProps[k]) {
-        console.warn(`[${this.callSid}] Tool "${name}" received unexpected arg "${k}" | valueType: ${typeof v}`);
-        continue;
-      }
-
-      const expectedType = schemaProps[k]?.type;
-      if (expectedType === Type.STRING && typeof v !== 'string') {
-        console.warn(`[${this.callSid}] Tool "${name}" arg "${k}" expected STRING but got ${typeof v} | value:`, safeJson(v));
-      }
-      if (expectedType === Type.NUMBER && typeof v !== 'number') {
-        console.warn(`[${this.callSid}] Tool "${name}" arg "${k}" expected NUMBER but got ${typeof v} | value:`, safeJson(v));
-      }
-      if (expectedType === Type.INTEGER) {
-        if (typeof v !== 'number' || !Number.isInteger(v)) {
-          console.warn(`[${this.callSid}] Tool "${name}" arg "${k}" expected INTEGER but got ${typeof v} | value:`, safeJson(v));
-        }
-      }
-      if (expectedType === Type.OBJECT && (typeof v !== 'object' || v === null || Array.isArray(v))) {
-        console.warn(`[${this.callSid}] Tool "${name}" arg "${k}" expected OBJECT but got ${typeof v} | value:`, safeJson(v));
-      }
-    }
   }
 }
 

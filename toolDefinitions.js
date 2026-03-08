@@ -2,7 +2,6 @@
 // Gemini function declarations for manageOrder and completeOrder
 // These schemas tell Gemini when to call a function and what arguments to pass.
 // DO NOT rename these functions — Peter 1's server.js depends on exact names.
-//TEST
 
 const { Type } = require('@google/genai');
 
