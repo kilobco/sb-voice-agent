@@ -225,7 +225,7 @@ const PRICE_MAP = {
   'Mango Lassi': 6.49
 };
 
-// In-memory sessions: callSid → { callDbId, cart, startedAt }
+// In-memory sessions: callSid → { callDbId, cart, startedAt, customerName, phoneNumber, orderConfirmed }
 const sessions = new Map();
 
 // ── Called by geminiSession.js when the call connects ─────────────────────
@@ -234,7 +234,10 @@ function createSession(callSid, callDbId) {
   sessions.set(callSid, {
     callDbId,
     cart: [],
-    startedAt: new Date()
+    startedAt: new Date(),
+    customerName: null,
+    phoneNumber: null,
+    orderConfirmed: false
   });
   console.log(`Session created for call: ${callSid}`);
 }
@@ -277,6 +280,9 @@ function handleManageOrder(callSid, args) {
     console.log(`Cart [${callSid}]: Removed ${itemName}`);
   }
 
+  // Reset confirmation when cart changes — customer must re-confirm
+  session.orderConfirmed = false;
+
   // Log current cart state after every change
   const subtotal = session.cart.reduce((s, i) => s + i.price * i.quantity, 0);
   console.log(`Cart subtotal: $${subtotal.toFixed(2)} | Items: ${session.cart.length}`);
@@ -292,17 +298,23 @@ function collectCustomerDetails(callSid, args) {
     return { result: 'Error: session not found', success: false };
   }
 
-  const { customerName, phoneNumber } = args;
+  const customerName = args?.customerName;
+  const phoneNumber = args?.phoneNumber;
 
-  // Validate customer name
-  if (!customerName || customerName.trim().length === 0) {
+  if (!customerName || typeof customerName !== 'string' || customerName.trim().length === 0) {
     return {
       result: 'Please provide your full name.',
       success: false
     };
   }
 
-  // Validate phone number (basic validation: at least 10 digits)
+  if (!phoneNumber || typeof phoneNumber !== 'string') {
+    return {
+      result: 'Please provide a valid phone number.',
+      success: false
+    };
+  }
+
   const phoneDigits = phoneNumber.replace(/\D/g, '');
   if (phoneDigits.length < 10) {
     return {
@@ -311,17 +323,49 @@ function collectCustomerDetails(callSid, args) {
     };
   }
 
-  // Store customer details in session
   session.customerName = customerName.trim();
   session.phoneNumber = phoneNumber;
 
   console.log(`Customer details collected [${callSid}]: ${session.customerName} | ${session.phoneNumber}`);
 
   return {
-    result: `Thank you, ${session.customerName}. I've saved your phone number: ${phoneNumber}. Let me confirm your order details.`,
+    result: `Thank you, ${session.customerName}. I've saved your phone number: ${phoneNumber}. Now call confirmOrder to lock in the order.`,
     success: true,
     customerName: session.customerName,
     phoneNumber: session.phoneNumber
+  };
+}
+
+// ── Called when Gemini fires the confirmOrder tool ─────────────────────────
+// Server-side gate: the customer must have verbally confirmed the order summary.
+// This sets the flag that handleCompleteOrder checks before writing to the DB.
+
+function confirmOrder(callSid) {
+  const session = getSession(callSid);
+  if (!session) {
+    return { result: 'Error: session not found', confirmed: false };
+  }
+
+  if (session.cart.length === 0) {
+    return { result: 'Cannot confirm an empty cart. Add items first.', confirmed: false };
+  }
+
+  if (!session.customerName || !session.phoneNumber) {
+    return { result: 'Customer name and phone number must be collected before confirming. Call collectCustomerDetails first.', confirmed: false };
+  }
+
+  session.orderConfirmed = true;
+
+  const subtotal = session.cart.reduce((s, i) => s + i.price * i.quantity, 0);
+  const total = Math.round(subtotal * (1 + TAX_RATE) * 100) / 100;
+
+  console.log(`Order confirmed by customer [${callSid}]: ${session.cart.length} items, total $${total}`);
+
+  return {
+    result: `Order confirmed by customer. ${session.cart.length} items, total $${total}. You may now call completeOrder to finalize.`,
+    confirmed: true,
+    itemCount: session.cart.length,
+    total
   };
 }
 
@@ -345,27 +389,31 @@ async function withRetry(fn, maxRetries = 3, delayMs = 1000) {
 }
 
 // ── Called when Gemini fires the completeOrder tool ───────────────────────
-// This is the big one — writes customer, order, and order_items to Supabase,
-// then pushes to Clover POS (non-blocking — Supabase is source of truth).
+// Reads customerName and phoneNumber from the session (set by collectCustomerDetails).
+// Requires orderConfirmed flag (set by confirmOrder).
 
-async function handleCompleteOrder(callSid, args) {
+async function handleCompleteOrder(callSid) {
   const session = sessions.get(callSid);
   if (!session) return { result: 'Error: session not found', orderId: null };
 
-  const { customerName, phoneNumber } = args;
-  const { callDbId, cart } = session;
+  if (!session.orderConfirmed) {
+    return { result: 'Error: order has not been confirmed by the customer yet. Call confirmOrder first after the customer says yes.', orderId: null };
+  }
+
+  if (!session.customerName || !session.phoneNumber) {
+    return { result: 'Error: customer name and phone number are missing. Call collectCustomerDetails first.', orderId: null };
+  }
+
+  const { callDbId, cart, customerName, phoneNumber } = session;
 
   if (cart.length === 0) {
     return { result: 'Error: cart is empty', orderId: null };
   }
 
   try {
-    // Red Team #14 — Wrap the entire Supabase write block in a retry loop.
-    // A single network glitch should not lose the order permanently.
     const result = await withRetry(async () => {
       const supabase = getSupabase();
 
-      // 1. Upsert customer by phone number (avoids duplicate customers)
       const { data: customer, error: custErr } = await supabase
         .from('customers')
         .upsert(
@@ -377,11 +425,9 @@ async function handleCompleteOrder(callSid, args) {
 
       if (custErr) console.error('Customer upsert error:', custErr.message);
 
-      // 2. Calculate totals
       const subtotal = cart.reduce((s, i) => s + i.price * i.quantity, 0);
       const total = Math.round(subtotal * (1 + TAX_RATE) * 100) / 100;
 
-      // 3. Insert order row
       const { data: order, error: orderErr } = await supabase
         .from('orders')
         .insert({
@@ -397,11 +443,9 @@ async function handleCompleteOrder(callSid, args) {
         .single();
 
       if (orderErr) {
-        // Throw so withRetry can retry this attempt
         throw new Error(`Order insert failed: ${orderErr.message}`);
       }
 
-      // 4. Insert one row per cart item into order_items
       const orderItems = cart.map(item => ({
         order_id: order.id,
         item_name: item.itemName,
@@ -416,7 +460,6 @@ async function handleCompleteOrder(callSid, args) {
 
       if (itemsErr) console.error('Order items error:', itemsErr.message);
 
-      // 5. Generate human-readable order number from UUID
       const orderNumber = 'SB-IRV-' + order.id.substring(0, 6).toUpperCase();
 
       console.log(`✓ Order confirmed: ${orderNumber} | Total: $${total} | Customer: ${customerName}`);
@@ -424,11 +467,9 @@ async function handleCompleteOrder(callSid, args) {
       return { order, orderNumber, total };
     });
 
-    // 6. Clear cart after successful order (outside retry so it only happens once)
     session.cart = [];
+    session.orderConfirmed = false;
 
-    // 7. Push to Clover POS — non-blocking, Supabase is source of truth.
-    // A Clover failure must never fail an already-confirmed order.
     let cloverOrderId = null;
     try {
       cloverOrderId = await pushOrderToClover(cart, customerName, result.total);
@@ -445,7 +486,6 @@ async function handleCompleteOrder(callSid, args) {
     };
 
   } catch (err) {
-    // All 3 retry attempts failed
     console.error('handleCompleteOrder failed after 3 attempts:', err.message);
     return {
       result: 'I am sorry, there is a brief system issue. Your order has been noted. ' +
@@ -468,5 +508,6 @@ module.exports = {
   handleManageOrder,
   handleCompleteOrder,
   deleteSession,
-  collectCustomerDetails
+  collectCustomerDetails,
+  confirmOrder
 };

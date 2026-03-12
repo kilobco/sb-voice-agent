@@ -1,5 +1,6 @@
 // toolDefinitions.js
-// Gemini function declarations for manageOrder and completeOrder
+// Gemini function declarations for manageOrder, collectCustomerDetails,
+// confirmOrder, and completeOrder.
 // These schemas tell Gemini when to call a function and what arguments to pass.
 // DO NOT rename these functions — Peter 1's server.js depends on exact names.
 
@@ -42,9 +43,10 @@ const manageOrderTool = {
 const collectCustomerDetailsTool = {
   name: 'collectCustomerDetails',
   description:
-    'Collect and validate the customer\'s name and phone number. Call this BEFORE ' +
-    'completeOrder to ensure you have valid customer information. This function will ' +
-    'validate the inputs and store them for the final order confirmation.',
+    'Collect and validate the customer\'s name and phone number. ' +
+    'You MUST call this BEFORE confirmOrder. This stores the customer ' +
+    'details in the session for the final order. ' +
+    'NEVER skip this step — completeOrder will reject without it.',
   parameters: {
     type: Type.OBJECT,
     properties: {
@@ -61,33 +63,38 @@ const collectCustomerDetailsTool = {
   }
 };
 
+const confirmOrderTool = {
+  name: 'confirmOrder',
+  description:
+    'Lock in the order after the customer verbally says YES to the order summary. ' +
+    'STRICT SEQUENCE: (1) Read back all items and total to the customer. ' +
+    '(2) Ask "Shall I confirm this order?" (3) Customer says yes. ' +
+    '(4) Call collectCustomerDetails with their name and phone. ' +
+    '(5) Call this confirmOrder tool. (6) Then call completeOrder. ' +
+    'NEVER call this before the customer has said yes AND you have collected their details.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {},
+    required: []
+  }
+};
+
 const completeOrderTool = {
   name: 'completeOrder',
   description:
     'Finalize and write the order to the database. ' +
-    'STRICT PRECONDITIONS — all three must be true before calling this: ' +
-    '(1) Customer verbally said yes to the order summary. ' +
-    '(2) Customer verbally said their name and you confirmed it back. ' +
-    '(3) Customer verbally said their phone number and you read it back digit by digit and they confirmed it. ' +
-    'NEVER call this with a guessed, assumed, or placeholder name or number. ' +
-    'NEVER use the caller ID as the phone number. ' +
-    'If you do not yet have both values from the customer\'s own mouth, ask for them first.',
+    'STRICT PRECONDITIONS — all must be true: ' +
+    '(1) collectCustomerDetails was called with the spoken name and confirmed phone number. ' +
+    '(2) confirmOrder was called after the customer said yes. ' +
+    'This tool takes NO parameters — it reads customer details from the session. ' +
+    'If you have not called collectCustomerDetails and confirmOrder first, this will fail.',
   parameters: {
     type: Type.OBJECT,
-    properties: {
-      customerName: {
-        type: Type.STRING,
-        description: 'The exact name the customer said out loud for their pickup order.'
-      },
-      phoneNumber: {
-        type: Type.STRING,
-        description: 'The phone number the customer said out loud and confirmed. Digits only, no dashes.'
-      }
-    },
-    required: ['customerName', 'phoneNumber']
+    properties: {},
+    required: []
   }
 };
 
-const tools = [{ functionDeclarations: [manageOrderTool, collectCustomerDetailsTool, completeOrderTool] }];
+const tools = [{ functionDeclarations: [manageOrderTool, collectCustomerDetailsTool, confirmOrderTool, completeOrderTool] }];
 
 module.exports = { tools };

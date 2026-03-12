@@ -1,9 +1,9 @@
 // cloverClient.js
-// Handles all communication with the Clover sandbox API.
+// Handles all communication with the Clover POS API.
 // Mirrors the lazy-init pattern from supabaseClient.js.
 // Only called when completeOrder fires — same lifecycle as Supabase writes.
 
-const CLOVER_BASE = 'https://apisandbox.dev.clover.com/v3';
+const CLOVER_BASE = process.env.CLOVER_BASE_URL || 'https://api.clover.com/v3';
 
 function getCloverConfig() {
   if (!process.env.CLOVER_API_TOKEN || !process.env.CLOVER_MERCHANT_ID) {
@@ -18,7 +18,6 @@ function getCloverConfig() {
 async function pushOrderToClover(cart, customerName, total) {
   const { token, merchantId } = getCloverConfig();
 
-  // 1. Create the order shell
   const orderRes = await fetch(`${CLOVER_BASE}/merchants/${merchantId}/orders`, {
     method: 'POST',
     headers: {
@@ -40,8 +39,6 @@ async function pushOrderToClover(cart, customerName, total) {
   const cloverOrder = await orderRes.json();
   const cloverOrderId = cloverOrder.id;
 
-  // 2. Add each cart item as a line item
-  // Clover requires price in cents (integer) and unitQty as quantity x 1000
   for (const item of cart) {
     const lineRes = await fetch(
       `${CLOVER_BASE}/merchants/${merchantId}/orders/${cloverOrderId}/line_items`,
@@ -53,15 +50,14 @@ async function pushOrderToClover(cart, customerName, total) {
         },
         body: JSON.stringify({
           name: item.itemName,
-          price: Math.round(item.price * 100), // dollars to cents
-          unitQty: item.quantity * 1000         // quantity to Clover fixed-point
+          price: Math.round(item.price * 100),
+          unitQty: item.quantity * 1000
         })
       }
     );
 
     if (!lineRes.ok) {
       const err = await lineRes.text();
-      // Log but continue — partial line items are better than no order
       console.error(`Clover line item failed for "${item.itemName}": ${err}`);
     }
   }

@@ -259,6 +259,7 @@ setGeminiHandlers((callSid, callDbId, twilioStream) => {
     callDbId,
     onAudioResponse: (chunk) => twilioStream.sendAudioToCaller(chunk),
     onTransferRequested: (number) => twilioStream.executeTransfer(number),
+    onClearAudio: () => twilioStream.clearAudioBuffer(),
     onSessionEnded: () => { }
   });
   session.start();
