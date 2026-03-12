@@ -36,3 +36,9 @@ externalPort = 80
 [deployment]
 deploymentTarget = "vm"
 run = ["node", "server.js"]
+
+[userenv]
+
+[userenv.shared]
+SUPABASE_URL = "https://gjwpfjnvdannaomsavej.supabase.co"
+DEFAULT_RESTAURANT_ID = "61578eda-fe0a-4d97-8d3d-d6b632c1af7c"
